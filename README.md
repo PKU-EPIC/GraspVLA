@@ -4,7 +4,7 @@
 
 <!-- [Shengliang Deng](https://shengliangd.github.io/about/), [Mi Yan](https://miyandoris.github.io/), [Songlin Wei](https://songlin.github.io/), Haixin Ma, Yuxin Yang, [Jiayi Chen](https://jychen18.github.io/), Zhiqi Zhang, Taoyu Yang, Xuheng Zhang, [Heming Cui](https://i.cs.hku.hk/~heming/), [Zhizheng Zhang](https://scholar.google.com/citations?user=X7M0I8kAAAAJ&hl=en), [He Wang](https://hughw19.github.io/) -->
 
-We present a cost-effective pretraining paradigm for training VLA models exclusively on large-scale synthetic data, achieving direct sim-to-real transfer and strong zero-shot generalizability for robotic grasping. Key contributions include:
+We present a cost-effective pretraining paradigm for VLA models using only synthetic data, achieving direct sim-to-real transfer and strong zero-shot generalizability for robotic grasping. Key contributions include:
 
 - **SynGrasp-1B**: a billion-frame synthetic grasping dataset, spanning 240 object categories and 10,000+ objects.
 
@@ -14,9 +14,9 @@ We present a cost-effective pretraining paradigm for training VLA models exclusi
 
 ![teaser](./figs/teaser.jpg)
 
-TODO:
+TODO List:
 - [ ] Release the supplementary material
-- [ ] Release the model weights
-- [ ] Release the dataset
+- [ ] Release model weights
+- [ ] Release Syn-Grasp-1B dataset
 
 [![License](https://licensebuttons.net/l/by-nc/4.0/88x31.png)](LICENSE)
