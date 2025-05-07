@@ -17,6 +17,6 @@ We present a cost-effective pretraining paradigm for VLA models using only synth
 TODO List:
 - [ ] Release the supplementary material
 - [ ] Release model weights
-- [ ] Release Syn-Grasp-1B dataset
+- [ ] Release SynGrasp-1B dataset
 
 [![License](https://licensebuttons.net/l/by-nc/4.0/88x31.png)](LICENSE)
