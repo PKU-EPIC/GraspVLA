@@ -1,0 +1,13 @@
+.vscode
+
+**/__pycache__
+**.egg-info
+
+data
+tmp
+exps
+ckpt
+wandb
+venv
+.idea
+vla_data
