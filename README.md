@@ -21,7 +21,7 @@ We present a cost-effective pretraining paradigm for VLA models using only synth
 
 ## Model Server
 
-Please follow the steps below to start the model server. We provide the checkpoint of GraspVLA on both [huggingface](https://huggingface.co/shengliangd/GraspVLA) and [Baidu cloud](https://pan.baidu.com/s/1DOJbKrKzdBcEIrFQ_NcuLw?pwd=6666). GraspVLA achieves 200ms inference latency using ~9GB of GPU memory when running on a single NVIDIA RTX L40 GPU.
+Please follow the steps below to start the model server. We provide the checkpoint of GraspVLA on both [huggingface](https://huggingface.co/shengliangd/GraspVLA) and [Baidu cloud](https://pan.baidu.com/s/1DOJbKrKzdBcEIrFQ_NcuLw?pwd=6666). GraspVLA achieves 200ms inference latency using ~9GB of GPU memory when running on a single NVIDIA RTX L40s GPU.
 
 ### Step 1: Clone the Repository
 ```bash
@@ -37,7 +37,18 @@ conda activate GraspVLA
 pip install -r requirements.txt
 ```
 
-### Step 3: Launch the Model Server
+### Step 3: Download Model Weights
+
+If you want to download from huggingface:
+```
+pip install -U "huggingface_hub"
+# set HF_ENDPOINT if you encounter connection issues:
+# export HF_ENDPOINT=https://hf-mirror.com
+hf download shengliangd/GraspVLA
+```
+The model weight will be placed at `~/.cache/huggingface/hub/models--shengliangd--GraspVLA/snapshots/f291eac1d3494c5c13c3d420af4e5bc987f23c3e/checkpoint/model.safetensors`.
+
+### Step 4: Launch the Model Server
 Run the model server with your desired configuration, for example:
 ```bash
 python3 -u -m vla_network.scripts.serve --path you-path-to-model.safetensors --port 6666
