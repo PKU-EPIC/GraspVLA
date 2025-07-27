@@ -1,3 +1,34 @@
+
+<div align="right">
+  <details>
+    <summary >🌐 Language</summary>
+    <div>
+      <div align="center">
+        <a href="https://openaitx.github.io/view.html?user=PKU-EPIC&project=GraspVLA&lang=en">English</a>
+        | <a href="https://openaitx.github.io/view.html?user=PKU-EPIC&project=GraspVLA&lang=zh-CN">简体中文</a>
+        | <a href="https://openaitx.github.io/view.html?user=PKU-EPIC&project=GraspVLA&lang=zh-TW">繁體中文</a>
+        | <a href="https://openaitx.github.io/view.html?user=PKU-EPIC&project=GraspVLA&lang=ja">日本語</a>
+        | <a href="https://openaitx.github.io/view.html?user=PKU-EPIC&project=GraspVLA&lang=ko">한국어</a>
+        | <a href="https://openaitx.github.io/view.html?user=PKU-EPIC&project=GraspVLA&lang=hi">हिन्दी</a>
+        | <a href="https://openaitx.github.io/view.html?user=PKU-EPIC&project=GraspVLA&lang=th">ไทย</a>
+        | <a href="https://openaitx.github.io/view.html?user=PKU-EPIC&project=GraspVLA&lang=fr">Français</a>
+        | <a href="https://openaitx.github.io/view.html?user=PKU-EPIC&project=GraspVLA&lang=de">Deutsch</a>
+        | <a href="https://openaitx.github.io/view.html?user=PKU-EPIC&project=GraspVLA&lang=es">Español</a>
+        | <a href="https://openaitx.github.io/view.html?user=PKU-EPIC&project=GraspVLA&lang=it">Itapano</a>
+        | <a href="https://openaitx.github.io/view.html?user=PKU-EPIC&project=GraspVLA&lang=ru">Русский</a>
+        | <a href="https://openaitx.github.io/view.html?user=PKU-EPIC&project=GraspVLA&lang=pt">Português</a>
+        | <a href="https://openaitx.github.io/view.html?user=PKU-EPIC&project=GraspVLA&lang=nl">Nederlands</a>
+        | <a href="https://openaitx.github.io/view.html?user=PKU-EPIC&project=GraspVLA&lang=pl">Polski</a>
+        | <a href="https://openaitx.github.io/view.html?user=PKU-EPIC&project=GraspVLA&lang=ar">العربية</a>
+        | <a href="https://openaitx.github.io/view.html?user=PKU-EPIC&project=GraspVLA&lang=fa">فارسی</a>
+        | <a href="https://openaitx.github.io/view.html?user=PKU-EPIC&project=GraspVLA&lang=tr">Türkçe</a>
+        | <a href="https://openaitx.github.io/view.html?user=PKU-EPIC&project=GraspVLA&lang=vi">Tiếng Việt</a>
+        | <a href="https://openaitx.github.io/view.html?user=PKU-EPIC&project=GraspVLA&lang=id">Bahasa Indonesia</a>
+      </div>
+    </div>
+  </details>
+</div>
+
 # GraspVLA: a Grasping Foundation Model Pre-trained on Billion-scale Synthetic Action Data
 
 [![arXiv](https://img.shields.io/badge/arXiv-2505.03233-df2a2a.svg)](https://arxiv.org/pdf/2505.03233)
