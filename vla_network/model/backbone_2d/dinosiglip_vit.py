@@ -1,14 +1,13 @@
 import timm
 import torch
-from torch import nn
 from dataclasses import dataclass
 from typing import List
-from timm.models.vision_transformer import VisionTransformer
 from PIL import Image
 from torchvision.transforms import Compose, Resize
 
 from . import Backbone2D, Backbone2DConfig
-from vla_network.config import ImageTransform
+from .common import ViT
+from vla_network.config.define import ImageTransform
 
 # Registry =>> Supported DinoSigLIP Pairs (as TIMM identifiers)
 DINOSigLIP_NAMES = {
@@ -29,22 +28,6 @@ class CombineImageTransform:
 
     def __call__(self, img: Image, **kwargs: str) -> torch.Tensor:
         return torch.stack([t(img, **kwargs) for t in self.transforms], dim=0)
-
-
-class ViT(nn.Module):
-    model: VisionTransformer
-
-    def __init__(self, model: VisionTransformer) -> None:
-        super().__init__()
-        self.model = model
-        self.n = len(self.model.blocks) - 2
-
-    @property
-    def embed_dim(self) -> int:
-        return self.model.embed_dim
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.model.get_intermediate_layers(x, n={self.n})[0]
 
 
 class DinoSigLIPViTBackbone(Backbone2D):

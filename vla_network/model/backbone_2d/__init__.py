@@ -2,7 +2,7 @@ from abc import ABC, abstractmethod
 import torch
 from torch import nn
 
-from vla_network.config import Backbone2DConfig, ImageTransform
+from vla_network.config.define import Backbone2DConfig, ImageTransform
 
 
 class Backbone2D(nn.Module, ABC):

@@ -1,12 +1,15 @@
 from typing import List, Optional
 
+import os
 import torch
 from torch import nn
 import copy
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 from transformers.modeling_outputs import CausalLMOutputWithPast
-from vla_network.config import LLMConfig
 
+from vla_network.utils.path import get_path_pretrained
+from vla_network.utils.logger import log
+from vla_network.config import LLMConfig
 
 PAD_TOKEN = "<PAD>"
 
@@ -16,15 +19,21 @@ class LLMBackbone(nn.Module):
     llm: PreTrainedModel
     tokenizer: PreTrainedTokenizerBase
 
-    def __init__(self, config: LLMConfig, train: bool = False) -> None:
+    def __init__(self, config: LLMConfig) -> None:
         super().__init__()
 
         config = copy.deepcopy(config)
 
         self.config = config
-        
+        ckpt_path = get_path_pretrained(config.name)
+        if os.path.isdir(ckpt_path):
+            log.info(f"Loading LLM weights from local path {ckpt_path}")
+        else:
+            ckpt_path = config.name
+            log.info(f"Loading LLM weights from Hugging Face {ckpt_path}")
+
         self.llm = config.model_cls.from_pretrained(
-            "internlm/internlm2-1_8b",
+            ckpt_path,
             attn_implementation=config.attn_implementation,
             do_sample=False,
             temperature=1.0,
@@ -36,7 +45,7 @@ class LLMBackbone(nn.Module):
         self.llm.config.use_cache = True
 
         self.tokenizer = config.token_cls.from_pretrained(
-            "internlm/internlm2-1_8b",
+            ckpt_path,
             model_max_length=self.config.max_len,
             padding_side="right",
             trust_remote_code=True,
@@ -49,6 +58,13 @@ class LLMBackbone(nn.Module):
         self.llm.resize_token_embeddings(
             len(self.tokenizer), pad_to_multiple_of=config.pad_multiple_of
         )
+
+    def requires_grad_(self, requires_grad: bool = True):
+        super().requires_grad_(requires_grad)
+        if requires_grad:
+            self.llm.enable_input_require_grads()
+        else:
+            self.llm.disable_input_require_grads()
 
     @property
     def input_dim(self) -> int:
@@ -126,7 +142,7 @@ class LLMBackbone(nn.Module):
         full_length = inputs_embeds.shape[1] + max_token_num
         full_length += past_key_values[0][0].shape[2] if past_key_values is not None else 0
         position_ids = torch.arange(full_length, device=device).unsqueeze(0)
-        if self.llm.config.attn_implementation == "flex_attention":
+        if self.llm.config.attn_implementation == "sdpa":
             attention_mask = torch.tril(torch.ones((full_length, full_length), device=device)).unsqueeze(0).unsqueeze(0)
         else:
             attention_mask = torch.ones((batch_size, full_length), device=device)
@@ -145,7 +161,7 @@ class LLMBackbone(nn.Module):
             position_ids = torch.cat([pad_pos, position_ids], dim=1)
 
             # pad attention_mask
-            if self.llm.config.attn_implementation == "flex_attention":
+            if self.llm.config.attn_implementation == "sdpa":
                 pad_mask = torch.zeros((*attention_mask.shape[:2], num_padding, full_length), dtype=attention_mask.dtype, device=attention_mask.device)
                 attention_mask = torch.cat([pad_mask, attention_mask], dim=2)
                 pad_mask2 = torch.zeros((*attention_mask.shape[:2], full_length+num_padding, num_padding), dtype=attention_mask.dtype, device=attention_mask.device)

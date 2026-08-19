@@ -1,13 +1,38 @@
-.vscode
+# Python
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
 
-**/__pycache__
-**.egg-info
+# Virtual environments
+.venv/
+venv/
+env/
 
-data
-tmp
-exps
-ckpt
-wandb
-venv
-.idea
-vla_data
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Training / serving artifacts
+data/
+tmp/
+exps/
+ckpt/
+wandb/
+vla_data/
+storage/
+logs/
+*.log
+
+# Accidental model or dataset dumps
+*.safetensors
+*.npz
+*.pt
+*.pth
+*.bin
+*.ckpt

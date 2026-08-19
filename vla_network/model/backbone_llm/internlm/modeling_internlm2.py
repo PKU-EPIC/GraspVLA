@@ -15,6 +15,8 @@
 # limitations under the License.
 """PyTorch InternLM2 model."""
 import math
+import queue
+import threading
 from typing import List, Optional, Tuple, Union
 import warnings
 from dataclasses import dataclass
@@ -24,18 +26,23 @@ import torch.nn.functional as F
 import torch.utils.checkpoint # type: ignore
 from einops import rearrange
 from torch import nn
-from torch.nn import CrossEntropyLoss
+from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache, StaticCache
+from transformers.modeling_attn_mask_utils import AttentionMaskConverter
 from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
     CausalLMOutputWithPast,
+    QuestionAnsweringModelOutput,
+    SequenceClassifierOutputWithPast,
+    TokenClassifierOutput,
 )
 from transformers.modeling_utils import PreTrainedModel
 from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
 from transformers.utils import (
     add_start_docstrings,
     add_start_docstrings_to_model_forward,
+    is_flash_attn_greater_or_equal_2_10,
     logging,
     replace_return_docstrings,
 )
@@ -367,6 +374,219 @@ class InternLM2Attention(nn.Module):
         return attn_output, attn_weights, past_key_value
 
 
+class InternLM2FlashAttention2(InternLM2Attention):
+    """
+    InternLM2 flash attention module. This module inherits from `InternLM2Attention` as the weights of the module stays
+    untouched. The only required change would be on the forward pass where it needs to correctly call the public API of
+    flash attention and deal with padding tokens in case the input contains any of them.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # TODO: Should be removed once Flash Attention for RoCm is bumped to 2.1.
+        # flash_attn<2.1 generates top-left aligned causal mask, while what is needed here is bottom-right alignement,
+        #   that was made default for flash_attn>=2.1. This attribute is used to handle this difference.
+        # Reference: https://github.com/Dao-AILab/flash-attention/releases/tag/v2.1.0.
+        # Beware that with flash_attn<2.1, using q_seqlen != k_seqlen (except for the case q_seqlen == 1)
+        #   produces a wrong mask (top-left).
+        self._flash_attn_uses_top_left_mask = not is_flash_attn_greater_or_equal_2_10()
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Cache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        cache_position: Optional[torch.LongTensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        if isinstance(past_key_value, StaticCache):
+            raise ValueError(
+                "`static` cache implementation is not compatible with `attn_implementation==flash_attention_2` "
+                "make sure to use `sdpa` in the mean time, and open an issue at "
+                "https://github.com/huggingface/transformers"
+            )
+
+        output_attentions = False
+
+        bsz, q_len, _ = hidden_states.size()
+
+        qkv_states = self.wqkv(hidden_states)
+
+        qkv_states = rearrange(
+            qkv_states,
+            "b q (h gs d) -> b q h gs d",
+            gs=2 + self.num_key_value_groups,
+            d=self.head_dim,
+        )
+
+        query_states = qkv_states[..., : self.num_key_value_groups, :]
+        query_states = rearrange(query_states, "b q h gs d -> b q (h gs) d")
+        key_states = qkv_states[..., -2, :]
+        value_states = qkv_states[..., -1, :]
+
+        query_states = query_states.transpose(1, 2)
+        key_states = key_states.transpose(1, 2)
+        value_states = value_states.transpose(1, 2)
+
+        cos, sin = self.rotary_emb(value_states, position_ids)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+        if past_key_value is not None:
+            # sin and cos are specific to RoPE models; cache_position needed for the static cache
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
+        # TODO: These transpose are quite inefficient but Flash Attention requires the layout
+        # [batch_size, sequence_length, num_heads, head_dim]. We would need to refactor the KV cache
+        # to be able to avoid many of these transpose/reshape/view.
+        query_states = query_states.transpose(1, 2)
+        key_states = key_states.transpose(1, 2)
+        value_states = value_states.transpose(1, 2)
+
+        # dropout_rate = self.attention_dropout if self.training else 0.0
+        dropout_rate = 0.0
+
+        # In PEFT, usually we cast the layer norms in float32 for training stability reasons
+        # therefore the input hidden states gets silently casted in float32. Hence, we need
+        # cast them back in the correct dtype just to be sure everything works as expected.
+        # This might slowdown training & inference so it is recommended to not cast the LayerNorms
+        # in fp32. (InternLM2RMSNorm handles it correctly)
+
+        input_dtype = query_states.dtype
+        if input_dtype == torch.float32:
+            if torch.is_autocast_enabled():
+                target_dtype = torch.get_autocast_gpu_dtype()
+            # Handle the case where the model is quantized
+            elif hasattr(self.config, "_pre_quantization_dtype"):
+                target_dtype = self.config._pre_quantization_dtype
+            else:
+                target_dtype = self.wqkv.weight.dtype
+
+            logger.warning_once(
+                f"The input hidden states seems to be silently casted in float32, this might be related to"
+                f" the fact you have upcasted embedding or layer norm layers in float32. We will cast back the input in"
+                f" {target_dtype}."
+            )
+
+            query_states = query_states.to(target_dtype)
+            key_states = key_states.to(target_dtype)
+            value_states = value_states.to(target_dtype)
+
+        attn_output = self._flash_attention_forward(
+            query_states, key_states, value_states, attention_mask, q_len, dropout=dropout_rate
+        )
+
+        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
+        attn_output = self.wo(attn_output)
+
+        if not output_attentions:
+            attn_weights = None
+
+        return attn_output, attn_weights, past_key_value  # pylint: disable=E0606
+
+    def _flash_attention_forward(
+        self, query_states, key_states, value_states, attention_mask, query_length, dropout=0.0, softmax_scale=None
+    ):
+        """
+        Calls the forward method of Flash Attention - if the input hidden states contain at least one padding token
+        first unpad the input, then computes the attention scores and pad the final attention scores.
+
+        Args:
+            query_states (`torch.Tensor`):
+                Input query states to be passed to Flash Attention API
+            key_states (`torch.Tensor`):
+                Input key states to be passed to Flash Attention API
+            value_states (`torch.Tensor`):
+                Input value states to be passed to Flash Attention API
+            attention_mask (`torch.Tensor`):
+                The padding mask - corresponds to a tensor of size `(batch_size, seq_len)` where 0 stands for the
+                position of padding tokens and 1 for the position of non-padding tokens.
+            dropout (`float`):
+                Attention dropout
+            softmax_scale (`float`, *optional*):
+                The scaling of QK^T before applying softmax. Default to 1 / sqrt(head_dim)
+        """
+        if not self._flash_attn_uses_top_left_mask:
+            causal = self.is_causal
+        else:
+            # TODO: Remove the `query_length != 1` check once Flash Attention for RoCm is bumped to 2.1.
+            # For details, please see the comment in InternLM2FlashAttention2 __init__.
+            causal = self.is_causal and query_length != 1
+
+        # Contains at least one padding token in the sequence
+        if attention_mask is not None:
+            batch_size = query_states.shape[0]
+            query_states, key_states, value_states, indices_q, cu_seq_lens, max_seq_lens = self._upad_input(
+                query_states, key_states, value_states, attention_mask, query_length
+            )
+
+            cu_seqlens_q, cu_seqlens_k = cu_seq_lens
+            max_seqlen_in_batch_q, max_seqlen_in_batch_k = max_seq_lens
+
+            attn_output_unpad = flash_attn_varlen_func(  # pylint: disable=E0606
+                query_states,
+                key_states,
+                value_states,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=max_seqlen_in_batch_q,
+                max_seqlen_k=max_seqlen_in_batch_k,
+                dropout_p=dropout,
+                softmax_scale=softmax_scale,
+                causal=causal,
+            )
+
+            attn_output = pad_input(attn_output_unpad, indices_q, batch_size, query_length)  # pylint: disable=E0606
+        else:
+            attn_output = flash_attn_func(  # pylint: disable=E0606
+                query_states, key_states, value_states, dropout, softmax_scale=softmax_scale, causal=causal
+            )
+
+        return attn_output
+
+    def _upad_input(self, query_layer, key_layer, value_layer, attention_mask, query_length):
+        indices_k, cu_seqlens_k, max_seqlen_in_batch_k = _get_unpad_data(attention_mask)
+        batch_size, kv_seq_len, num_key_value_heads, head_dim = key_layer.shape
+
+        key_layer = index_first_axis(  # pylint: disable=E0606
+            key_layer.reshape(batch_size * kv_seq_len, num_key_value_heads, head_dim), indices_k
+        )
+        value_layer = index_first_axis(  # pylint: disable=E0606
+            value_layer.reshape(batch_size * kv_seq_len, num_key_value_heads, head_dim), indices_k
+        )
+        if query_length == kv_seq_len:
+            query_layer = index_first_axis(  # pylint: disable=E0606
+                query_layer.reshape(batch_size * kv_seq_len, self.num_heads, head_dim), indices_k
+            )
+            cu_seqlens_q = cu_seqlens_k
+            max_seqlen_in_batch_q = max_seqlen_in_batch_k
+            indices_q = indices_k
+        elif query_length == 1:
+            max_seqlen_in_batch_q = 1
+            cu_seqlens_q = torch.arange(
+                batch_size + 1, dtype=torch.int32, device=query_layer.device
+            )  # There is a memcpy here, that is very bad.
+            indices_q = cu_seqlens_q[:-1]
+            query_layer = query_layer.squeeze(1)
+        else:
+            # The -q_len: slice assumes left padding.
+            attention_mask = attention_mask[:, -query_length:]
+            query_layer, indices_q, cu_seqlens_q, max_seqlen_in_batch_q = unpad_input(  # pylint: disable=E0606
+                query_layer, attention_mask
+            )
+
+        return (
+            query_layer,
+            key_layer,
+            value_layer,
+            indices_q,
+            (cu_seqlens_q, cu_seqlens_k),
+            (max_seqlen_in_batch_q, max_seqlen_in_batch_k),
+        )
+
 class InternLM2FlexAttention(InternLM2Attention):
     """
     InternLM2 block attention module. This module enables each token to access its own block and all the preceding blocks.
@@ -375,10 +595,113 @@ class InternLM2FlexAttention(InternLM2Attention):
         super().__init__(config, layer_idx)
         warnings.warn('Flex Attention not implemented, use pytorch version instead')
         self.is_causal = False
+    
+
+# Copied from transformers.models.llama.modeling_llama.LllamaSdpaAttention with Llama->InternLM2
+class InternLM2SdpaAttention(InternLM2Attention):
+    """
+    InternLM2 attention module using torch.nn.functional.scaled_dot_product_attention. This module inherits from
+    `InternLM2Attention` as the weights of the module stays untouched. The only changes are on the forward pass
+    to adapt to SDPA API.
+    """
+
+    # Adapted from InternLM2Attention.forward
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Cache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        cache_position: Optional[torch.LongTensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        if output_attentions:
+            # TODO: Improve this warning with e.g. `model.config.attn_implementation = "manual"`
+            # once this is implemented.
+            logger.warning_once(
+                "InternLM2Model uses InternLM2SdpaAttention, but `torch.nn.functional.scaled_dot_product_attention` "
+                "does not support `output_attentions=True`. Falling back to the manual attention implementation, "
+                "but specifying the manual implementation will be required from Transformers version v5.0.0 onwards. "
+                'This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
+            )
+            return super().forward(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                cache_position=cache_position,
+            )
+
+        bsz, q_len, _ = hidden_states.size()
+
+        qkv_states = self.wqkv(hidden_states)
+
+        qkv_states = rearrange(
+            qkv_states,
+            "b q (h gs d) -> b q h gs d",
+            gs=2 + self.num_key_value_groups,
+            d=self.head_dim,
+        )
+
+        query_states = qkv_states[..., : self.num_key_value_groups, :]
+        query_states = rearrange(query_states, "b q h gs d -> b q (h gs) d")
+        key_states = qkv_states[..., -2, :]
+        value_states = qkv_states[..., -1, :]
+
+        query_states = query_states.transpose(1, 2)
+        key_states = key_states.transpose(1, 2)
+        value_states = value_states.transpose(1, 2)
+
+        cos, sin = self.rotary_emb(value_states, position_ids)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+        if past_key_value is not None:
+            # sin and cos are specific to RoPE models; cache_position needed for the static cache
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+        causal_mask = attention_mask
+        if attention_mask is not None:
+            causal_mask = causal_mask[:, :, :, : key_states.shape[-2]]
+
+        # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with
+        # custom attn_mask, Reference: https://github.com/pytorch/pytorch/issues/112577.
+        if query_states.device.type == "cuda" and causal_mask is not None:
+            query_states = query_states.contiguous()
+            key_states = key_states.contiguous()
+            value_states = value_states.contiguous()
+
+        # We dispatch to SDPA's Flash Attention or Efficient kernels via this `is_causal` if statement instead of
+        # an inline conditional assignment in SDPA to support both torch.compile's dynamic shapes and full graph
+        # options. An inline conditional prevents dynamic shapes from compiling.
+        is_causal = bool(causal_mask is None and q_len > 1)
+
+        attn_output = torch.nn.functional.scaled_dot_product_attention(  # pylint: disable=E1102
+            query_states,
+            key_states,
+            value_states,
+            attn_mask=causal_mask,
+            dropout_p=0.0,
+            is_causal=is_causal,
+        )
+
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.view(bsz, q_len, self.wo.in_features)
+        attn_output = self.wo(attn_output)
+
+        return attn_output, None, past_key_value
 
 
 INTERNLM2_ATTENTION_CLASSES = {
     "eager": InternLM2Attention,
+    "flash_attention_2": InternLM2FlashAttention2,
+    "sdpa": InternLM2SdpaAttention,
     "flex_attention": InternLM2FlexAttention,
 }
 
@@ -728,6 +1051,7 @@ class InternLM2Model(InternLM2PreTrainedModel):
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
         )
+
     def _update_causal_mask(
         self,
         attention_mask: torch.Tensor,
@@ -736,8 +1060,32 @@ class InternLM2Model(InternLM2PreTrainedModel):
         past_key_values: Cache,
         output_attentions: bool,
     ):
+        # TODO: As of torch==2.2.0, the `attention_mask` passed to the model in `generate` is 2D and of dynamic length
+        # even when the static KV cache is used. This is an issue for torch.compile which then recaptures cudagraphs at
+        # each decode steps due to the dynamic shapes. (`recording cudagraph tree for symint key 13`, etc.), which is
+        # VERY slow. A workaround is `@torch.compiler.disable`, but this prevents using `fullgraph=True`.
+        # See more context in https://github.com/huggingface/transformers/pull/29114
+
+        if self.config.attn_implementation == "flash_attention_2":
+            if attention_mask is not None and 0.0 in attention_mask:
+                return attention_mask
+            return None
+
+        # For SDPA, when possible, we will rely on its `is_causal` argument instead of its `attn_mask` argument, in
+        # order to dispatch on Flash Attention 2. This feature is not compatible with static cache, as SDPA will fail
+        # to infer the attention mask.
         past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
         using_static_cache = isinstance(past_key_values, StaticCache)
+
+        # When output attentions is True, sdpa implementation's forward method calls the eager implementation's forward
+        if self.config.attn_implementation == "sdpa" and not using_static_cache and not output_attentions:
+            if AttentionMaskConverter._ignore_causal_mask_sdpa(
+                attention_mask,
+                inputs_embeds=input_tensor,
+                past_key_values_length=past_seen_tokens,
+                is_training=self.training,
+            ):
+                return None
 
         dtype, device = input_tensor.dtype, input_tensor.device
         min_dtype = torch.finfo(dtype).min
@@ -751,7 +1099,7 @@ class InternLM2Model(InternLM2PreTrainedModel):
                 else past_seen_tokens + sequence_length + 1
             )
 
-        if self.config.attn_implementation == "flex_attention":
+        if self.config.attn_implementation in ["flex_attention", "eager", "sdpa"]:
             assert attention_mask is not None and attention_mask.dim() == 4
             attention_mask = attention_mask.to(dtype).masked_fill(attention_mask == 0, min_dtype)
             return attention_mask
@@ -779,6 +1127,16 @@ class InternLM2Model(InternLM2PreTrainedModel):
                 causal_mask[:, :, :, :mask_length] = causal_mask[:, :, :, :mask_length].masked_fill(
                     padding_mask, min_dtype
                 )
+        if (
+            self.config.attn_implementation == "sdpa"
+            and attention_mask is not None
+            and attention_mask.device.type == "cuda"
+            and not output_attentions
+        ):
+            # Attend to all tokens in fully masked rows in the causal_mask, for example the relevant first rows when
+            # using left padding. This is required by F.scaled_dot_product_attention memory-efficient attention path.
+            # Details: https://github.com/pytorch/pytorch/issues/110213
+            causal_mask = AttentionMaskConverter._unmask_unattended(causal_mask, min_dtype)  # pylint: disable=E1120
 
         return causal_mask
 
@@ -912,6 +1270,554 @@ class InternLM2ForCausalLM(InternLM2PreTrainedModel):
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+    def prepare_inputs_for_generation(
+        self,
+        input_ids,
+        past_key_values=None,
+        attention_mask=None,
+        inputs_embeds=None,
+        cache_position=None,
+        use_cache=True,
+        **kwargs,
+    ):
+        past_length = 0
+        if past_key_values is not None:
+            if isinstance(past_key_values, Cache):
+                past_length = cache_position[0] if cache_position is not None else past_key_values.get_seq_length()
+                max_cache_length = (
+                    torch.tensor(past_key_values.get_max_length(), device=input_ids.device)
+                    if past_key_values.get_max_length() is not None
+                    else None
+                )
+                cache_length = past_length if max_cache_length is None else torch.min(max_cache_length, past_length)
+            # TODO joao: remove this `else` after `generate` prioritizes `Cache` objects
+            else:
+                cache_length = past_length = past_key_values[0][0].shape[2]
+                max_cache_length = None
+
+            # Keep only the unprocessed tokens:
+            # 1 - If the length of the attention_mask exceeds the length of input_ids, then we are in a setting where
+            # some of the inputs are exclusively passed as part of the cache (e.g. when passing input_embeds as input)
+            if attention_mask is not None and attention_mask.shape[1] > input_ids.shape[1]:
+                input_ids = input_ids[:, -(attention_mask.shape[1] - past_length) :]
+            # 2 - If the past_length is smaller than input_ids', then input_ids holds all input tokens. We can discard
+            # input_ids based on the past_length.
+            elif past_length < input_ids.shape[1]:
+                input_ids = input_ids[:, past_length:]
+            # 3 - Otherwise (past_length >= input_ids.shape[1]), let's assume input_ids only has unprocessed tokens.
+
+            # If we are about to go beyond the maximum cache length, we need to crop the input attention mask.
+            if (
+                max_cache_length is not None
+                and attention_mask is not None
+                and cache_length + input_ids.shape[1] > max_cache_length
+            ):
+                attention_mask = attention_mask[:, -max_cache_length:]  # pylint: disable=E1130
+
+        position_ids = kwargs.get("position_ids", None)
+        if attention_mask is not None and position_ids is None:
+            # create position_ids on the fly for batch generation
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 1)
+            if past_key_values:
+                position_ids = position_ids[:, -input_ids.shape[1] :]
+
+        # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
+        if inputs_embeds is not None and past_key_values is None:
+            model_inputs = {"inputs_embeds": inputs_embeds}
+        else:
+            # The `contiguous()` here is necessary to have a static stride during decoding. torchdynamo otherwise
+            # recompiles graphs as the stride of the inputs is a guard.
+            # Ref: https://github.com/huggingface/transformers/pull/29114
+            # TODO: use `next_tokens` directly instead.
+            model_inputs = {"input_ids": input_ids.contiguous()}
+
+        input_length = position_ids.shape[-1] if position_ids is not None else input_ids.shape[-1]
+        if cache_position is None:
+            cache_position = torch.arange(past_length, past_length + input_length, device=input_ids.device)
+        elif use_cache:
+            cache_position = cache_position[-input_length:]
+
+        model_inputs.update(
+            {
+                "position_ids": position_ids,
+                "cache_position": cache_position,
+                "past_key_values": past_key_values,
+                "use_cache": use_cache,
+                "attention_mask": attention_mask,
+            }
+        )
+        return model_inputs
+
+    @staticmethod
+    def _reorder_cache(past_key_values, beam_idx):
+        reordered_past = ()
+        for layer_past in past_key_values:
+            reordered_past += (
+                tuple(past_state.index_select(0, beam_idx.to(past_state.device)) for past_state in layer_past),
+            )
+        return reordered_past
+
+    def build_inputs(self, tokenizer, query: str, history: List[Tuple[str, str]] = None, meta_instruction=""):
+        if history is None:
+            history = []
+        if tokenizer.add_bos_token:
+            prompt = ""
+        else:
+            prompt = tokenizer.bos_token
+        if meta_instruction:
+            prompt += f"""<|im_start|>system\n{meta_instruction}<|im_end|>\n"""
+        for record in history:
+            prompt += f"""<|im_start|>user\n{record[0]}<|im_end|>\n<|im_start|>assistant\n{record[1]}<|im_end|>\n"""
+        prompt += f"""<|im_start|>user\n{query}<|im_end|>\n<|im_start|>assistant\n"""
+        return tokenizer([prompt], return_tensors="pt")
+
+    @torch.no_grad()
+    def chat(
+        self,
+        tokenizer,
+        query: str,
+        history: Optional[List[Tuple[str, str]]] = None,
+        streamer: Optional[BaseStreamer] = None,
+        max_new_tokens: int = 1024,
+        do_sample: bool = True,
+        temperature: float = 0.8,
+        top_p: float = 0.8,
+        meta_instruction: str = "You are an AI assistant whose name is InternLM (书生·浦语).\n"
+        "- InternLM (书生·浦语) is a conversational language model that is developed by Shanghai AI Laboratory "
+        "(上海人工智能实验室). It is designed to be helpful, honest, and harmless.\n"
+        "- InternLM (书生·浦语) can understand and communicate fluently in the language chosen by the user such "
+        "as English and 中文.",
+        **kwargs,
+    ):
+        if history is None:
+            history = []
+        inputs = self.build_inputs(tokenizer, query, history, meta_instruction)
+        inputs = {k: v.to(self.device) for k, v in inputs.items() if torch.is_tensor(v)}
+        # also add end-of-assistant token in eos token id to avoid unnecessary generation
+        eos_token_id = [tokenizer.eos_token_id, tokenizer.convert_tokens_to_ids(["<|im_end|>"])[0]]
+        outputs = self.generate(
+            **inputs,
+            streamer=streamer,
+            max_new_tokens=max_new_tokens,
+            do_sample=do_sample,
+            temperature=temperature,
+            top_p=top_p,
+            eos_token_id=eos_token_id,
+            **kwargs,
+        )
+        outputs = outputs[0].cpu().tolist()[len(inputs["input_ids"][0]) :]
+        response = tokenizer.decode(outputs, skip_special_tokens=True)
+        response = response.split("<|im_end|>")[0]
+        history = history + [(query, response)]
+        return response, history
+
+    @torch.no_grad()
+    def stream_chat(
+        self,
+        tokenizer,
+        query: str,
+        history: List[Tuple[str, str]] = None,
+        max_new_tokens: int = 1024,
+        do_sample: bool = True,
+        temperature: float = 0.8,
+        top_p: float = 0.8,
+        **kwargs,
+    ):
+        if history is None:
+            history = []
+        """
+        Return a generator in format: (response, history)
+        Eg.
+        ('你好，有什么可以帮助您的吗', [('你好', '你好，有什么可以帮助您的吗')])
+        ('你好，有什么可以帮助您的吗？', [('你好', '你好，有什么可以帮助您的吗？')])
+        """
+        if BaseStreamer is None:
+            raise ModuleNotFoundError(
+                "The version of `transformers` is too low. Please make sure "
+                "that you have installed `transformers>=4.28.0`."
+            )
+
+        response_queue = queue.Queue(maxsize=20)
+
+        class ChatStreamer(BaseStreamer):
+            """
+            Streamer used in generate to print words one by one.
+            """
+
+            def __init__(self, tokenizer) -> None:
+                super().__init__()
+                self.tokenizer = tokenizer
+                self.queue = response_queue
+                self.query = query
+                self.history = history
+                self.response = ""
+                self.cache = []
+                self.received_inputs = False
+                self.queue.put((self.response, history + [(self.query, self.response)]))
+
+            def put(self, value):
+                if len(value.shape) > 1 and value.shape[0] > 1:
+                    raise ValueError("ChatStreamer only supports batch size 1")
+                elif len(value.shape) > 1:
+                    value = value[0]
+
+                if not self.received_inputs:
+                    # The first received value is input_ids, ignore here
+                    self.received_inputs = True
+                    return
+
+                self.cache.extend(value.tolist())
+                token = self.tokenizer.decode(self.cache, skip_special_tokens=True)
+                if token.strip() != "<|im_end|>":
+                    self.response = self.response + token
+                    history = self.history + [(self.query, self.response)]
+                    self.queue.put((self.response, history))
+                    self.cache = []
+                else:
+                    self.end()
+
+            def end(self):
+                self.queue.put(None)
+
+        def stream_producer():
+            return self.chat(
+                tokenizer=tokenizer,
+                query=query,
+                streamer=ChatStreamer(tokenizer=tokenizer),
+                history=history,
+                max_new_tokens=max_new_tokens,
+                do_sample=do_sample,
+                temperature=temperature,
+                top_p=top_p,
+                **kwargs,
+            )
+
+        def consumer():
+            producer = threading.Thread(target=stream_producer)
+            producer.start()
+            while True:
+                res = response_queue.get()
+                if res is None:
+                    return
+                yield res
+
+        return consumer()
+
+
+# Copied from transformers.models.llama.modeling_llama.LlamaForSequenceClassification with Llama->InternLM2
+@add_start_docstrings(
+    """
+    The InternLM2 Model transformer with a sequence classification head on top (linear layer).
+
+    [`InternLM2ForSequenceClassification`] uses the last token in order to do the classification, as other causal models
+    (e.g. GPT-2) do.
+
+    Since it does classification on the last token, it requires to know the position of the last token. If a
+    `pad_token_id` is defined in the configuration, it finds the last token that is not a padding token in each row. If
+    no `pad_token_id` is defined, it simply takes the last value in each row of the batch. Since it cannot guess the
+    padding tokens when `inputs_embeds` are passed instead of `input_ids`, it does the same (take the last value in
+    each row of the batch).
+    """,
+    InternLM2_START_DOCSTRING,
+)
+class InternLM2ForSequenceClassification(InternLM2PreTrainedModel):
+    """Sequence Classification Head for InternLM2 Model."""
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.num_labels = config.num_labels
+        self.model = InternLM2Model(config)
+        self.score = nn.Linear(config.hidden_size, self.num_labels, bias=False)
+
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    def get_input_embeddings(self):
+        return self.model.tok_embeddings
+
+    def set_input_embeddings(self, value):
+        self.model.tok_embeddings = value
+
+    @add_start_docstrings_to_model_forward(InternLM2_INPUTS_DOCSTRING)
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+    ) -> Union[Tuple, SequenceClassifierOutputWithPast]:
+        r"""
+        labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
+            Labels for computing the sequence classification/regression loss. Indices should be in `[0, ...,
+            config.num_labels - 1]`. If `config.num_labels == 1` a regression loss is computed (Mean-Square loss), If
+            `config.num_labels > 1` a classification loss is computed (Cross-Entropy).
+        """
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        transformer_outputs = self.model(
+            input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+        hidden_states = transformer_outputs[0]
+        logits = self.score(hidden_states)
+
+        if input_ids is not None:
+            batch_size = input_ids.shape[0]
+        else:
+            batch_size = inputs_embeds.shape[0]
+
+        if self.config.pad_token_id is None and batch_size != 1:
+            raise ValueError("Cannot handle batch sizes > 1 if no padding token is defined.")
+        if self.config.pad_token_id is None:
+            sequence_lengths = -1
+        else:
+            if input_ids is not None:
+                # if no pad token found, use modulo instead of reverse indexing for ONNX compatibility
+                sequence_lengths = torch.eq(input_ids, self.config.pad_token_id).int().argmax(-1) - 1
+                sequence_lengths = sequence_lengths % input_ids.shape[-1]
+                sequence_lengths = sequence_lengths.to(logits.device)
+            else:
+                sequence_lengths = -1
+
+        pooled_logits = logits[torch.arange(batch_size, device=logits.device), sequence_lengths]
+
+        loss = None
+        if labels is not None:
+            labels = labels.to(logits.device)
+            if self.config.problem_type is None:
+                if self.num_labels == 1:
+                    self.config.problem_type = "regression"
+                elif self.num_labels > 1 and (labels.dtype in (torch.long, torch.int)):
+                    self.config.problem_type = "single_label_classification"
+                else:
+                    self.config.problem_type = "multi_label_classification"
+
+            if self.config.problem_type == "regression":
+                loss_fct = MSELoss()
+                if self.num_labels == 1:
+                    loss = loss_fct(pooled_logits.squeeze(), labels.squeeze())
+                else:
+                    loss = loss_fct(pooled_logits, labels)
+            elif self.config.problem_type == "single_label_classification":
+                loss_fct = CrossEntropyLoss()
+                loss = loss_fct(pooled_logits.view(-1, self.num_labels), labels.view(-1))
+            elif self.config.problem_type == "multi_label_classification":
+                loss_fct = BCEWithLogitsLoss()
+                loss = loss_fct(pooled_logits, labels)
+        if not return_dict:
+            output = (pooled_logits,) + transformer_outputs[1:]
+            return ((loss,) + output) if loss is not None else output
+
+        return SequenceClassifierOutputWithPast(
+            loss=loss,
+            logits=pooled_logits,
+            past_key_values=transformer_outputs.past_key_values,
+            hidden_states=transformer_outputs.hidden_states,
+            attentions=transformer_outputs.attentions,
+        )
+
+
+# Copied from transformers.models.llama.modeling_llama.LlamaForQuestionAnswering with Llama->InternLM2
+@add_start_docstrings(
+    """
+The InternLM2 Model transformer with a span classification head on top for extractive question-answering tasks like
+SQuAD (a linear layer on top of the hidden-states output to compute `span start logits` and `span end logits`).
+    """,
+    InternLM2_START_DOCSTRING,
+)
+class InternLM2ForQuestionAnswering(InternLM2PreTrainedModel):
+    """Question Answering model for InternLM2."""
+
+    base_model_prefix = "transformer"
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.transformer = InternLM2Model(config)
+        self.qa_outputs = nn.Linear(config.hidden_size, 2)
+
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    def get_input_embeddings(self):
+        return self.transformer.tok_embeddings
+
+    def set_input_embeddings(self, value):
+        self.transformer.tok_embeddings = value
+
+    @add_start_docstrings_to_model_forward(InternLM2_INPUTS_DOCSTRING)
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        start_positions: Optional[torch.LongTensor] = None,
+        end_positions: Optional[torch.LongTensor] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+    ) -> Union[Tuple, QuestionAnsweringModelOutput]:
+        r"""
+        start_positions (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
+            Labels for position (index) of the start of the labelled span for computing the token classification loss.
+            Positions are clamped to the length of the sequence (`sequence_length`). Position outside of the sequence
+            are not taken into account for computing the loss.
+        end_positions (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
+            Labels for position (index) of the end of the labelled span for computing the token classification loss.
+            Positions are clamped to the length of the sequence (`sequence_length`). Position outside of the sequence
+            are not taken into account for computing the loss.
+        """
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        outputs = self.transformer(
+            input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        sequence_output = outputs[0]
+
+        logits = self.qa_outputs(sequence_output)
+        start_logits, end_logits = logits.split(1, dim=-1)
+        start_logits = start_logits.squeeze(-1).contiguous()
+        end_logits = end_logits.squeeze(-1).contiguous()
+
+        total_loss = None
+        if start_positions is not None and end_positions is not None:
+            # If we are on multi-GPU, split add a dimension
+            if len(start_positions.size()) > 1:
+                start_positions = start_positions.squeeze(-1).to(start_logits.device)
+            if len(end_positions.size()) > 1:
+                end_positions = end_positions.squeeze(-1).to(end_logits.device)
+            # sometimes the start/end positions are outside our model inputs, we ignore these terms
+            ignored_index = start_logits.size(1)
+            start_positions = start_positions.clamp(0, ignored_index)
+            end_positions = end_positions.clamp(0, ignored_index)
+
+            loss_fct = CrossEntropyLoss(ignore_index=ignored_index)
+            start_loss = loss_fct(start_logits, start_positions)
+            end_loss = loss_fct(end_logits, end_positions)
+            total_loss = (start_loss + end_loss) / 2
+
+        if not return_dict:
+            output = (start_logits, end_logits) + outputs[2:]
+            return ((total_loss,) + output) if total_loss is not None else output
+
+        return QuestionAnsweringModelOutput(
+            loss=total_loss,
+            start_logits=start_logits,
+            end_logits=end_logits,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+
+# Copied from transformers.models.llama.modeling_llama.LlamaForTokenClassification with Llama->InternLM2
+@add_start_docstrings(
+    """
+    The InternLM2 Model transformer with a token classification head on top (a linear layer on top of the hidden-states
+    output) e.g. for Named-Entity-Recognition (NER) tasks.
+    """,
+    InternLM2_START_DOCSTRING,
+)
+class InternLM2ForTokenClassification(InternLM2PreTrainedModel):
+    """Token classification model for InternLM2."""
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.num_labels = config.num_labels
+        self.model = InternLM2Model(config)
+        if getattr(config, "classifier_dropout", None) is not None:
+            classifier_dropout = config.classifier_dropout
+        elif getattr(config, "hidden_dropout", None) is not None:
+            classifier_dropout = config.hidden_dropout
+        else:
+            classifier_dropout = 0.1
+        self.dropout = nn.Dropout(classifier_dropout)
+        self.score = nn.Linear(config.hidden_size, config.num_labels)
+
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    def get_input_embeddings(self):
+        return self.model.tok_embeddings
+
+    def set_input_embeddings(self, value):
+        self.model.tok_embeddings = value
+
+    @add_start_docstrings_to_model_forward(InternLM2_INPUTS_DOCSTRING)
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+    ) -> Union[Tuple, SequenceClassifierOutputWithPast]:
+        r"""
+        labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
+            Labels for computing the sequence classification/regression loss. Indices should be in `[0, ...,
+            config.num_labels - 1]`. If `config.num_labels == 1` a regression loss is computed (Mean-Square loss), If
+            `config.num_labels > 1` a classification loss is computed (Cross-Entropy).
+        """
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        outputs = self.model(
+            input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+        sequence_output = outputs[0]
+        sequence_output = self.dropout(sequence_output)
+        logits = self.score(sequence_output)
+
+        loss = None
+        if labels is not None:
+            loss_fct = CrossEntropyLoss()
+            loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+
+        if not return_dict:
+            output = (logits,) + outputs[2:]
+            return ((loss,) + output) if loss is not None else output
+
+        return TokenClassifierOutput(
+            loss=loss,
+            logits=logits,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )

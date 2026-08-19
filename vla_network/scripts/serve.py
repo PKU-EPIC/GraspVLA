@@ -1,4 +1,5 @@
 # FIXME: import urchin before others, otherwise segfault, unknown reason
+from urchin import URDF, Collision, Sphere, Geometry # type: ignore
 
 import os
 if 'DEBUG_PORT' in os.environ:
@@ -10,24 +11,25 @@ if 'DEBUG_PORT' in os.environ:
 import argparse
 arg_parser = argparse.ArgumentParser()
 arg_parser.add_argument("--port", type=str, required=True)
+arg_parser.add_argument("--batching-delay", type=float, default=80)
+arg_parser.add_argument("--batch-size", type=int, default=1)
 arg_parser.add_argument("--path", type=str, required=True)
 arg_parser.add_argument("--compile", action="store_true")
 
 
 import PIL
 import io
-import os
 from typing import List
 import zmq
 import pickle
 import time
 import numpy as np
 from tqdm import tqdm
-from vla_network.model.vla import VLAAgent
-from vla_network.data_preprocessing.prompt import COT_PROMPT
+from vla_network.model.vla.agent import VLAAgent
+from vla_network.datasample.vla import VLASample
+from vla_network.utils.logger import log
 import torch
 torch.autograd.set_grad_enabled(False)
-
 
 def interpolate_delta_actions(delta_actions, n):
     """
@@ -46,81 +48,93 @@ def interpolate_delta_actions(delta_actions, n):
     return ret
 
 
-def infer_single_sample(vla_model: VLAAgent, sample: dict):
-    input_data = []
-    if sample.get('compressed', False):
-        for key in ['front_view_image', 'side_view_image']:
-            decompressed_image_array = []
-            for compressed_image in sample[key]:
-                decompressed_image_array.append(np.array(PIL.Image.open(io.BytesIO(compressed_image))))
-            sample[key] = decompressed_image_array
-        sample['compressed'] = False
-    proprio_array = np.array([sample['proprio_array'][-4], sample['proprio_array'][-1]])
-    proprio_array[:, -1] = (proprio_array[:, -1] + 1) / 2
-    input_data.append({
-        'env_id': 0,
-        'text': COT_PROMPT(sample['text']),
-        'proprio_array': proprio_array,
-        'front_view_image': [sample['front_view_image'][-1]],
-        'side_view_image': [sample['side_view_image'][-1]],
-    })
-    results = vla_model(input_data) # the model recieve a list of input samples
-    result = results[0]  # only one sample
-    action = result['action']
-    # Quantize last dimension of action to 0, 1 using 0.4, 0.6 as bin boundaries
-    last_dim = action[:, -1]
-    last_dim = np.where(last_dim < 0.4, -1, np.where(last_dim > 0.6, 1, 0))
-    action = np.concatenate([action[:, :-1], last_dim[:, None]], axis=-1)
-    action = interpolate_delta_actions(action, 2)
-    debug = {}
-    if 'goal' in result:
-        debug['pose'] = result['goal']
-    if 'bbox' in result:
-        debug['bbox'] = result['bbox']
-    return {
-        'result': action,
-        'env_id': 0,
-        'debug': debug,
-    }
+def batch_process(vla_model: VLAAgent, batch: List[dict]):
+    for sample in batch:
+        if sample.get('compressed', False):
+            for key in ['image_array', 'image_wrist_array']:
+                decompressed_image_array = []
+                for compressed_image in sample[key]:
+                    decompressed_image_array.append(np.array(PIL.Image.open(io.BytesIO(compressed_image))))
+                sample[key] = decompressed_image_array
+            sample['compressed'] = False
+
+    assert vla_model.config.model.image_keys == ["left", "right"]  # TODO: make it universal
+    dt_steps = round(vla_model.config.model.dt / 0.1)  # TODO: make it universal
+    frame_indices = list(range(-(vla_model.config.model.proprio_steps-1)*dt_steps-1, 0, dt_steps))
+    input_batch = []
+    for sample in batch:
+        input_batch.append(VLASample(
+            dataset_name="agent",
+            embodiment='epiclab_franka',
+            frame=0,
+            instruction=sample['text'],
+            images=dict(
+                left=[PIL.Image.fromarray(sample['image_wrist_array'][i]) for i in frame_indices[-vla_model.config.model.image_steps:]],
+                right=[PIL.Image.fromarray(sample['image_array'][i]) for i in frame_indices[-vla_model.config.model.image_steps:]],
+            ),
+            proprio=np.array([sample['proprio_array'][i] for i in frame_indices]),
+        ))
+    results: List[VLASample] = vla_model(input_batch)
+    ret = []
+    for result, input_sample in zip(results, batch):
+        action = result.action
+        # Quantize last dimension of action to 0, 1 using 0.4, 0.6 as bin boundaries
+        last_dim = action[:, -1]
+        last_dim = np.where(last_dim < -0.5, -1, np.where(last_dim > 0.5, 1, 0))
+        action = np.concatenate([action[:, :-1], last_dim[:, None]], axis=-1)
+        action = interpolate_delta_actions(action, dt_steps)
+        debug = {}
+        if result.goal is not None:
+            debug['pose'] = (result.goal[:3], result.goal[3:6])
+        if result.bboxs is not None:
+            debug['bbox'] = [result.bboxs[k][-1] for k in vla_model.config.model.image_keys]
+        ret.append({
+            'result': action,
+            'env_id': input_sample['env_id'],
+            'debug': debug,
+        })
+    return ret
 
 
 def warmup(vla_model: VLAAgent):
     SAMPLES = [
         {
             'text': 'pick up elephant',
-            'front_view_image': [np.zeros((256, 256, 3), dtype=np.uint8)],
-            'side_view_image': [np.zeros((256, 256, 3), dtype=np.uint8)],
+            'image_array': [np.zeros((256, 256, 3), dtype=np.uint8)],
+            'image_wrist_array': [np.zeros((256, 256, 3), dtype=np.uint8)],
             'proprio_array': [np.concatenate([np.zeros((6,), dtype=np.float32), np.ones((1,), dtype=np.float32)])]*4,
+            'traj_metadata': None,
+            'env_id': 1,
         },
         {
             'text': 'pick up toy large elephant',
-            'front_view_image': [np.zeros((256, 256, 3), dtype=np.uint8)],
-            'side_view_image': [np.zeros((256, 256, 3), dtype=np.uint8)],
+            'image_array': [np.zeros((256, 256, 3), dtype=np.uint8)],
+            'image_wrist_array': [np.zeros((256, 256, 3), dtype=np.uint8)],
             'proprio_array': [np.concatenate([np.zeros((6,), dtype=np.float32), np.ones((1,), dtype=np.float32)])]*4,
+            'traj_metadata': None,
+            'env_id': 2,
         },
         {
             'text': 'pick up toy car',
-            'front_view_image': [np.zeros((256, 256, 3), dtype=np.uint8)],
-            'side_view_image': [np.zeros((256, 256, 3), dtype=np.uint8)],
+            'image_array': [np.zeros((256, 256, 3), dtype=np.uint8)],
+            'image_wrist_array': [np.zeros((256, 256, 3), dtype=np.uint8)],
             'proprio_array': [np.concatenate([np.zeros((6,), dtype=np.float32), np.ones((1,), dtype=np.float32)])]*4,
+            'traj_metadata': None,
+            'env_id': 3,
         },
     ]
     NUM_TESTS = 5
     print('warming up...')
     for i in tqdm(range(NUM_TESTS)):
-        ret = infer_single_sample(vla_model, SAMPLES[i%len(SAMPLES)])
+        ret = batch_process(vla_model, [SAMPLES[i%len(SAMPLES)]])
     print('check the latency after warm up:')
     for i in tqdm(range(NUM_TESTS)):
-        ret = infer_single_sample(vla_model, SAMPLES[i%len(SAMPLES)])
+        ret = batch_process(vla_model, [SAMPLES[i%len(SAMPLES)]])
 
 
 def main():
     args = arg_parser.parse_args()
     vla_model = VLAAgent(args.path, compile=args.compile)
-    
-    vla_model.preprocessor.config.robot_rep = "identity"
-
-    assert vla_model.data_cfg.action_rel_len == 0
 
     warmup(vla_model)
 
@@ -128,37 +142,48 @@ def main():
     socket = context.socket(zmq.ROUTER)
     socket.bind(f"tcp://*:{args.port}")
 
-    print(f"Started server on port {args.port}")
-
     requests = []
+    first_arrive_time = None
 
+    log.info('start serving')
     while True:
-       # run inference if data is ready
-        if (len(requests) > 0):
-            client_id, data_received = requests[0]
-            
+       # run inference if batch is ready
+        current_time = time.time() * 1000
+        if (len(requests) >= args.batch_size or 
+            ((first_arrive_time is not None) and 
+             (current_time - first_arrive_time > args.batching_delay) and 
+             len(requests) > 0)):
+            data_num = min(args.batch_size, len(requests))
+            client_ids, data_batch = zip(*requests[:data_num])
+
             tbegin = time.time()
-            print(f'start processing a request')
-            result = infer_single_sample(vla_model, data_received)
+            log.info(f'start processing {len(requests)} requests')
+            results = batch_process(vla_model, data_batch)
             tend = time.time()
-            print(f'finished a request in {tend-tbegin:.3f}s')
+            log.info(f'finished {len(requests)} requests in {tend - tbegin:.3f}s')
 
-            socket.send_multipart([
-                client_id,
-                b'',
-                pickle.dumps({
-                    'info': 'success',
-                    'env_id': result['env_id'],
-                    'result': result['result'],
-                    'debug': result['debug'],
-                })
-            ])
+            for client_id, result in zip(client_ids, results):
+                socket.send_multipart([
+                    client_id,
+                    b'',
+                    pickle.dumps({
+                        'info': 'success',
+                        'env_id': result['env_id'],
+                        'result': result['result'],
+                        'debug': result['debug'],
+                    })
+                ])
 
-            requests = requests[1:]
+            requests = requests[data_num:]
+            if len(requests) == 0:
+                first_arrive_time = None
 
         # try getting new sample
         try:
             client_id, empty, data = socket.recv_multipart(zmq.DONTWAIT)
+            if len(requests) == 0:
+                first_arrive_time = time.time() * 1000
+
             data = pickle.loads(data)
             requests.append((client_id, data))
         except zmq.Again:

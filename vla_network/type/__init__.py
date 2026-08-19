@@ -1,1 +1,3 @@
-from .data_type import RawVLAData, BatchVLAData  # type: ignore
+from .data_type import NdArray
+
+__all__ = ["NdArray"]

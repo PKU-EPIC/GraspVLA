@@ -142,9 +142,8 @@ class InternLM2Config(PretrainedConfig):
         self.rope_theta = rope_theta
         self.rope_scaling = rope_scaling
         self._rope_scaling_validation()
-        self.attn_implementation = attn_implementation
-        if self.attn_implementation is None:
-            self.attn_implementation = "eager"
+        print("overriding attn_implementation to sdpa")
+        self.attn_implementation = "sdpa"
 
         super().__init__(
             pad_token_id=pad_token_id,
