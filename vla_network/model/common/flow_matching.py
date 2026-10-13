@@ -2,6 +2,7 @@ from typing import Optional, Tuple, Union, Callable
 import torch
 from torch import nn
 import torch.nn.functional as F
+from torch.distributions import Normal
 
 from vla_network.config import FlowMatchingConfig
 
@@ -50,7 +51,40 @@ class BaseFlowMatchingModule(nn.Module):
 
     def update(self, x_t: torch.FloatTensor, v_t: torch.FloatTensor, dt: Union[float, torch.FloatTensor], timestep: Union[float, torch.FloatTensor]) -> torch.FloatTensor:
         return x_t + dt * v_t
-    
+
+    @staticmethod
+    def stochastic_euler_step(
+        x_t: torch.Tensor,
+        v_t: torch.Tensor,
+        dt: float,
+        sigma: float,
+        generator: Optional[torch.Generator] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Sample one reverse-Euler transition and return per-sample log probability."""
+        if sigma <= 0:
+            raise ValueError("sigma must be positive for a stochastic policy transition")
+        mean = x_t - dt * v_t
+        std = sigma * (abs(dt) ** 0.5)
+        noise = torch.randn(mean.shape, device=mean.device, dtype=mean.dtype, generator=generator)
+        next_x = mean + std * noise
+        log_prob = Normal(mean.float(), std).log_prob(next_x.float()).flatten(1).sum(-1)
+        return next_x, log_prob
+
+    @staticmethod
+    def transition_log_prob(
+        x_t: torch.Tensor,
+        next_x: torch.Tensor,
+        v_t: torch.Tensor,
+        dt: float,
+        sigma: float,
+    ) -> torch.Tensor:
+        """Recompute log probability under the exact stochastic Euler transition."""
+        if sigma <= 0:
+            raise ValueError("sigma must be positive for a stochastic policy transition")
+        mean = x_t - dt * v_t
+        std = sigma * (abs(dt) ** 0.5)
+        return Normal(mean.float(), std).log_prob(next_x.float()).flatten(1).sum(-1)
+
     def denoise(self, compute_v_t: Callable[[torch.FloatTensor, torch.FloatTensor], torch.FloatTensor], x_t: torch.FloatTensor, iter_num: int) -> torch.FloatTensor:
         device, dtype = x_t.device, x_t.dtype
         time_vec = torch.ones((len(x_t),), device=device, dtype=dtype)

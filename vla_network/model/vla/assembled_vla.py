@@ -722,44 +722,74 @@ class AssembledVLA(nn.Module, BaseVLA):
             ret = self.generate_autoregressive(input_ids, robot_input_ids, proj_feat_2d, attention_mask, robot_attention_mask, max_token_num, token_pattern, inference_kwargs)[0], None
         return ret
     
-    def generate_flow_matching(self, prefix_kv_cache, prefix_mask, prefix_block_mask, proprio, flow_matching_iter):
+    def prepare_flow_context(self, prefix_kv_cache, prefix_mask, prefix_block_mask, proprio):
+        """Prepare the cached context shared by all flow integration steps."""
         device, dtype = prefix_kv_cache[0][0].device, prefix_kv_cache[0][0].dtype
-        assert self.config.model_specific.action_expert
-        assert self.config.model_specific.llm.attn_implementation == "sdpa"
-        proprio = proprio.to(dtype)
-        # TODO: should move to flow matching module instead of here
-        noise = self.flow_module.sample_noise(
-            batch_size=len(proprio),
-            device=device,
-            dtype=dtype
-        )
-        proprio_embeds = self.flow_module.proprior_proj(proprio)
+        if not self.config.model_specific.action_expert:
+            raise ValueError("stochastic flow sampling requires an action expert")
+        if self.config.model_specific.llm.attn_implementation != "sdpa":
+            raise ValueError("stochastic flow sampling currently requires SDPA")
+        proprio_embeds = self.flow_module.proprior_proj(proprio.to(dtype))
         suffix_mask, suffix_block_mask = self.flow_module.get_suffix_masks(proprio_embeds)
-
         full_input_mask = torch.cat((prefix_mask, suffix_mask), dim=1)
         full_block_mask = torch.cat((prefix_block_mask, suffix_block_mask), axis=0)
         full_attn_mask = make_block_attn_mask(full_input_mask, full_block_mask).to(dtype)
         full_position_ids = torch.cumsum(full_input_mask, dim=1) - 1
-        suffix_attn_mask = full_attn_mask[:, :, -suffix_mask.shape[1]:, ...]
-        suffix_position_ids = full_position_ids[:, -suffix_mask.shape[1]:]
+        return (
+            tuple(prefix_kv_cache),
+            proprio_embeds,
+            full_attn_mask[:, :, -suffix_mask.shape[1]:, ...],
+            full_position_ids[:, -suffix_mask.shape[1]:],
+        )
 
-        prefix_kv_cache = tuple(prefix_kv_cache)
+    def predict_flow_velocity(self, context, x_t: torch.Tensor, time_vec: torch.Tensor):
+        prefix_kv_cache, proprio_embeds, suffix_attn_mask, suffix_position_ids = context
+        suffix_embeds = self.flow_module.embed_suffix_flow_matching_embeds(
+            proprio_embeds, x_t, time_vec
+        )
+        action_expert_output = self.action_expert(
+            attention_mask=suffix_attn_mask,
+            position_ids=suffix_position_ids,
+            inputs_embeds=suffix_embeds,
+            past_key_values=prefix_kv_cache,
+            use_cache=True,
+            output_hidden_states=True,
+        )
+        action_hidden_states = action_expert_output.hidden_states[-1][:, -self.config.action_steps:]
+        return self.flow_module.get_v_t(action_hidden_states)
+
+    def stochastic_generate_flow_matching(
+        self, context, flow_matching_iter=5, sigma=0.01, generator=None
+    ):
+        """Sample a stochastic flow trajectory and return final action plus transitions."""
+        prefix_kv_cache, proprio_embeds, _, _ = context
+        del prefix_kv_cache, proprio_embeds
+        device = context[1].device
+        dtype = context[1].dtype
+        x_t = self.flow_module.sample_noise(
+            batch_size=context[1].shape[0], device=device, dtype=dtype
+        )
+        dt = -1.0 / flow_matching_iter
+        transitions = []
+        for step in range(flow_matching_iter):
+            time_vec = torch.full((x_t.shape[0],), 1.0 + step * dt, device=device, dtype=dtype)
+            v_t = self.predict_flow_velocity(context, x_t, time_vec)
+            next_x, log_prob = self.flow_module.stochastic_euler_step(
+                x_t, v_t, dt, sigma, generator=generator
+            )
+            transitions.append((x_t, next_x, time_vec, log_prob))
+            x_t = next_x
+        return x_t, transitions
+
+    def generate_flow_matching(self, prefix_kv_cache, prefix_mask, prefix_block_mask, proprio, flow_matching_iter):
+        context = self.prepare_flow_context(prefix_kv_cache, prefix_mask, prefix_block_mask, proprio)
+        device, dtype = context[1].device, context[1].dtype
+        noise = self.flow_module.sample_noise(batch_size=len(proprio), device=device, dtype=dtype)
 
         def compute_v_t(x_t: torch.Tensor, time_vec: torch.Tensor):
-            suffix_embeds = self.flow_module.embed_suffix_flow_matching_embeds(proprio_embeds, x_t, time_vec)
-            action_expert_output = self.action_expert(
-                attention_mask=suffix_attn_mask,
-                position_ids=suffix_position_ids,
-                inputs_embeds=suffix_embeds,
-                past_key_values=prefix_kv_cache, use_cache=True, output_hidden_states=True,
-            )
+            return self.predict_flow_velocity(context, x_t, time_vec)
 
-            action_hidden_states = action_expert_output.hidden_states[-1][:, -self.config.action_steps:]
-            v_t = self.flow_module.get_v_t(action_hidden_states)
-            return v_t
-
-        x_0 = self.flow_module.denoise(compute_v_t, noise, flow_matching_iter)
-        return x_0   
+        return self.flow_module.denoise(compute_v_t, noise, flow_matching_iter)
 
     def generate_autoregressive(self, input_ids, robot_input_ids, proj_feat_2d, attention_mask, robot_attention_mask, max_token_num, token_pattern, inference_kwargs, require_kv_cache=False) -> Tuple[TokenPattern, Optional[Any]]:
         """Returns token pattern and kv cache.
